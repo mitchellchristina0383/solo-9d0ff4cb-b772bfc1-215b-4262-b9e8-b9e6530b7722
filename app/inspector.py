@@ -268,7 +268,21 @@ class ProcInspector:
         if interval_seconds > 0:
             time.sleep(interval_seconds)
         round2 = self.snapshot_round(unique_pids)
+        return self.build_result(unique_pids, interval_seconds, round1, round2)
 
+    def build_result(
+        self,
+        pids: List[int],
+        interval_seconds: float,
+        round1: Dict[int, "PidSnapshot"],
+        round2: Dict[int, "PidSnapshot"],
+    ) -> InspectionResult:
+        """根据两轮已采集的快照汇总巡检结果。
+
+        抽出该方法后，调用方（如退出演示编排）可以自行控制两轮采样之间
+        发生的动作与等待时长，再复用同一套判定规则。
+        """
+        unique_pids = list(dict.fromkeys(pids))
         rounds_summary = [
             self._round_summary(1, round1),
             self._round_summary(2, round2),

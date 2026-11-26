@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -29,6 +31,8 @@ def client():
 class FakeSampleHandler:
     """替代 httpx 调用 sample 服务的假处理器，记录调用。
 
+    按真实 sample 服务的语义维护"命名实例"：每次 setup 生成唯一实例名，
+    release/status/cleanup 都只作用于对应实例，用于验证并发演示互不干扰。
     测试可通过替换 ``on_request`` 注入副作用（如模拟进程退出）。
     """
 
@@ -36,14 +40,27 @@ class FakeSampleHandler:
         self.calls = []
         self.release_count = 0
         self.on_request = None
+        # 实例名 -> {"pids": [...], "alive": bool}
+        self.instances: dict = {}
+        self.cleaned_instances: list = []
+        # 置为 HTTP 状态码可让 release 强制失败
+        self.release_fail_status: int | None = None
+        self._seq = 0
 
     async def __call__(self, method: str, url: str, **kwargs):
         class _Resp:
-            def __init__(self, payload):
+            def __init__(self, payload, status_code=200, text=""):
                 self._payload = payload
+                self.status_code = status_code
+                self.text = text or str(payload)
 
             def raise_for_status(self):
-                return None
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {self.status_code}",
+                        request=httpx.Request("POST", url),
+                        response=self,
+                    )
 
             def json(self):
                 return self._payload
@@ -59,12 +76,40 @@ class FakeSampleHandler:
                 {"scenario": "shared-close-wait", "pids": pids, "alive": True}
             )
         if url.endswith("/exit-during-inspection/setup"):
+            self._seq += 1
+            name = f"exit-during-inspection-fake{self._seq}"
+            self.instances[name] = {"pids": [910 + self._seq - 1], "alive": True}
             return _Resp(
-                {"scenario": "exit-during-inspection", "pids": [910], "alive": True}
+                {
+                    "scenario": name,
+                    "pids": list(self.instances[name]["pids"]),
+                    "alive": True,
+                }
             )
-        if url.endswith("/exit-during-inspection/release"):
+        if "/exit-during-inspection/" in url and url.endswith("/release"):
+            name = url.split("/exit-during-inspection/")[1].split("/")[0]
+            inst = self.instances.get(name)
+            if inst is None:
+                return _Resp({"detail": "not found"}, status_code=404)
+            if self.release_fail_status is not None:
+                return _Resp(
+                    {"detail": "forced failure"},
+                    status_code=self.release_fail_status,
+                )
             self.release_count += 1
-            return _Resp({"released": True})
+            inst["alive"] = False
+            return _Resp({"released": True, "scenario": name})
+        if "/exit-during-inspection/" in url and url.endswith("/status"):
+            name = url.split("/exit-during-inspection/")[1].split("/")[0]
+            inst = self.instances.get(name)
+            if inst is None:
+                return _Resp({"detail": "not found"}, status_code=404)
+            return _Resp({"scenario": name, "alive": inst["alive"]})
+        if method == "DELETE" and "/exit-during-inspection/" in url:
+            name = url.split("/exit-during-inspection/")[1]
+            self.cleaned_instances.append(name)
+            self.instances.pop(name, None)
+            return _Resp({"cleaned": True, "scenario": name})
         if url.endswith("/scenarios/status"):
             return _Resp({})
         if url.endswith("/scenarios"):
@@ -184,19 +229,27 @@ def test_demo_shared_close_wait(client, fake_proc, fake_sample):
     assert sorted(h["pid"] for h in holders) == [900, 901]
 
 
+def _add_exiting_holder(fake_proc, pid=910, starttime=5, inode=7002):
+    row = tcp_row(0, "10.0.0.2:50001", "10.0.0.1:9000", CLOSE_WAIT, inode)
+    fake_proc.add_pid(pid, comm="holder", starttime=starttime, tcp_rows=[row], fds={4: inode})
+
+
 def test_demo_exit_during_inspection(client, fake_proc, fake_sample, monkeypatch):
-    row = tcp_row(0, "10.0.0.2:50001", "10.0.0.1:9000", CLOSE_WAIT, 7002)
-    fake_proc.add_pid(910, comm="holder", starttime=5, tcp_rows=[row], fds={4: 7002})
+    """标准流程：首轮采到本次 holder 后才 release，确认退出后二采并出报告。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910)
+    release_seen = {"t": None}
+    round1_seen = {"t": None}
+    started = time.monotonic()
 
     async def on_request(method, url):
-        # release 触发后，模拟 holder 从 /proc 消失
         if url.endswith("/release"):
+            release_seen["t"] = time.monotonic() - started
+            # release 触发后，模拟本次 holder 从 /proc 消失
             fake_proc.remove_pid(910)
 
     fake_sample.on_request = on_request
 
-    # release 协程在 interval/2=0.5s 时触发；让第二轮采样前等待 0.8s，
-    # 保证线程池中的第二轮读取发生在 release 之后
     from app.inspector import ProcInspector as _PI
 
     real_snapshot = _PI.snapshot_round
@@ -204,23 +257,206 @@ def test_demo_exit_during_inspection(client, fake_proc, fake_sample, monkeypatch
 
     def patched_snapshot(self, pids):
         call_count["n"] += 1
-        if call_count["n"] == 2:
-            time.sleep(0.8)
+        if call_count["n"] == 1:
+            round1_seen["t"] = time.monotonic() - started
         return real_snapshot(self, pids)
 
     monkeypatch.setattr(_PI, "snapshot_round", patched_snapshot)
+
+    t0 = time.monotonic()
+    resp = client.post(
+        "/demo/run-exit-during-inspection",
+        json={"interval_seconds": 1, "children": 0},
+    )
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # release 只发生一次，且晚于第一轮采样
+    assert fake_sample.release_count == 1
+    assert release_seen["t"] is not None and round1_seen["t"] is not None
+    assert release_seen["t"] >= round1_seen["t"]
+    # 完整睡满设定间隔后才进入第二轮（允许少量调度误差）
+    assert elapsed >= 1.0
+
+    unconf = body["inspection"]["unconfirmable_pids"]
+    assert len(unconf) == 1
+    assert unconf[0]["pid"] == 910
+    assert "exited" in unconf[0]["reason"]
+    assert unconf[0]["round1"] is not None
+    assert unconf[0]["round2"] is None
+    assert body["exit_confirmation"]["state"] == "exited"
+    assert body["exit_confirmation"]["pid"] == 910
+
+
+def test_demo_exit_concurrent_instances_isolated(
+    client, fake_proc, fake_sample, monkeypatch
+):
+    """两个并发演示各自操作独立实例：release 只杀掉自己的 holder。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910, inode=7002)
+    _add_exiting_holder(fake_proc, pid=911, inode=7003)
+
+    async def on_request(method, url):
+        # 每个实例的 release 只移除自己的 PID
+        if url.endswith("/release"):
+            name = url.split("/exit-during-inspection/")[1].split("/")[0]
+            pid = fake_sample.instances[name]["pids"][0]
+            fake_proc.remove_pid(pid)
+
+    fake_sample.on_request = on_request
+
+    results = []
+    errors = []
+
+    def run_demo():
+        try:
+            local = TestClient(main_mod.app)
+            resp = local.post(
+                "/demo/run-exit-during-inspection",
+                json={"interval_seconds": 1, "children": 0},
+            )
+            results.append(resp)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=run_demo)
+    t2 = threading.Thread(target=run_demo)
+    t1.start()
+    # 第二个请求在第一个等待第二轮采样期间就开始
+    time.sleep(0.3)
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert not errors
+    assert len(results) == 2
+    instances = []
+    for resp in results:
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        instances.append(body["scenario"]["scenario"])
+        unconf = body["inspection"]["unconfirmable_pids"]
+        assert len(unconf) == 1
+        assert unconf[0]["pid"] == body["scenario"]["pids"][0]
+        assert body["exit_confirmation"]["state"] == "exited"
+    # 两次 setup 产生了不同的实例名，各释放各的
+    assert len(set(instances)) == 2
+    assert fake_sample.release_count == 2
+
+
+def test_demo_exit_round1_missing_returns_error_and_cleans_up(
+    client, fake_proc, fake_sample, monkeypatch
+):
+    """首轮采样排队期间 holder 已退出：返回错误而非假成功，并回收本次实例。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    # 故意不向 fake_proc 添加 910：模拟首轮就采不到本次进程
+    resp = client.post(
+        "/demo/run-exit-during-inspection",
+        json={"interval_seconds": 1, "children": 0},
+    )
+    assert resp.status_code == 502
+    assert "round 1 sampling failed" in resp.json()["detail"]
+    # 未触发 release，且本次实例已被回收
+    assert fake_sample.release_count == 0
+    assert len(fake_sample.cleaned_instances) == 1
+
+
+def test_demo_exit_release_failure_returns_error_and_cleans_up(
+    client, fake_proc, fake_sample, monkeypatch
+):
+    """release 被 sample 拒绝：返回错误并回收本次 holder。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910)
+    fake_sample.release_fail_status = 409
 
     resp = client.post(
         "/demo/run-exit-during-inspection",
         json={"interval_seconds": 1, "children": 0},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 502
+    assert "release rejected" in resp.json()["detail"]
+    assert len(fake_sample.cleaned_instances) == 1
+
+
+def test_demo_exit_holder_exits_before_release(
+    client, fake_proc, fake_sample, monkeypatch
+):
+    """首轮采到后、release 时进程已自行退出（409）：报错并回收，不假装成功。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910)
+    fake_sample.release_fail_status = 409
+
+    resp = client.post(
+        "/demo/run-exit-during-inspection",
+        json={"interval_seconds": 1, "children": 0},
+    )
+    assert resp.status_code == 502
+    assert "release rejected" in resp.json()["detail"]
+    assert fake_sample.cleaned_instances  # 已尝试回收
+
+
+def test_demo_exit_pid_reuse_detected(client, fake_proc, fake_sample, monkeypatch):
+    """release 后同 PID 被新进程换代：识别为 reused 并列入 unconfirmable。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910, starttime=5)
+
+    async def on_request(method, url):
+        if url.endswith("/release"):
+            # 模拟同 PID 被新进程占用（starttime 变化）
+            fake_proc.replace_starttime(910, 999)
+
+    fake_sample.on_request = on_request
+
+    resp = client.post(
+        "/demo/run-exit-during-inspection",
+        json={"interval_seconds": 1, "children": 0},
+    )
+    assert resp.status_code == 200, resp.text
     body = resp.json()
+    assert body["exit_confirmation"]["state"] == "reused"
     unconf = body["inspection"]["unconfirmable_pids"]
     assert len(unconf) == 1
     assert unconf[0]["pid"] == 910
-    assert "exited" in unconf[0]["reason"]
-    assert fake_sample.release_count == 1
+    assert "reused" in unconf[0]["reason"]
+
+
+def test_demo_exit_full_interval_waited_before_round2(
+    client, fake_proc, fake_sample, monkeypatch
+):
+    """第二轮必须在睡满完整间隔且确认退出之后才开始。"""
+    monkeypatch.setattr(main_mod, "EXIT_CONFIRM_TIMEOUT", 2.0)
+    _add_exiting_holder(fake_proc, pid=910)
+    timeline = []
+
+    async def on_request(method, url):
+        if url.endswith("/release"):
+            timeline.append(("release", time.monotonic()))
+            fake_proc.remove_pid(910)
+
+    fake_sample.on_request = on_request
+
+    from app.inspector import ProcInspector as _PI
+
+    real_snapshot = _PI.snapshot_round
+
+    def patched_snapshot(self, pids):
+        timeline.append((f"snapshot#{len(timeline)}", time.monotonic()))
+        return real_snapshot(self, pids)
+
+    monkeypatch.setattr(_PI, "snapshot_round", patched_snapshot)
+
+    t0 = time.monotonic()
+    resp = client.post(
+        "/demo/run-exit-during-inspection",
+        json={"interval_seconds": 1, "children": 0},
+    )
+    assert resp.status_code == 200, resp.text
+    release_t = next(t for name, t in timeline if name == "release")
+    second_snapshot_t = timeline[-1][1]
+    # 第二次快照距 release 至少隔了完整 interval（确认退出轮询在其后）
+    assert second_snapshot_t - release_t >= 1.0 - 0.05
+    assert second_snapshot_t - t0 >= 1.0
 
 
 def test_demo_cleanup_and_status(client, fake_sample):

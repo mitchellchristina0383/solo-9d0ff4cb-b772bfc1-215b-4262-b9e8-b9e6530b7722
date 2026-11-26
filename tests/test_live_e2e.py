@@ -132,6 +132,65 @@ def test_exit_during_inspection_real_process(live_services):
     # 第一轮采到过该进程，第二轮已消失
     assert unconf[0]["round1"] is not None
     assert unconf[0]["round2"] is None
+    # 新编排会回报退出确认结果
+    assert body["exit_confirmation"]["state"] == "exited"
+    assert body["exit_confirmation"]["interval_seconds_waited"] == 2
+
+    httpx.delete(f"{base}/demo/cleanup", timeout=10)
+
+
+def test_two_concurrent_exit_demos_are_isolated(live_services):
+    """真实进程并发：两个不同间隔的演示各自退出自己的 holder，互不串扰。"""
+    import concurrent.futures
+
+    base = live_services
+    httpx.delete(f"{base}/demo/cleanup", timeout=10)
+
+    def run(interval: float):
+        return httpx.post(
+            f"{base}/demo/run-exit-during-inspection",
+            json={"interval_seconds": interval, "children": 0},
+            timeout=40,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(run, 2.0)
+        # 第二个请求在第一个等待第二轮采样期间开始
+        time.sleep(0.5)
+        f2 = pool.submit(run, 1.0)
+        resp1, resp2 = f1.result(), f2.result()
+
+    assert resp1.status_code == 200, resp1.text
+    assert resp2.status_code == 200, resp2.text
+    b1, b2 = resp1.json(), resp2.json()
+
+    # 两次演示是不同的场景实例、不同的 holder PID
+    assert b1["scenario"]["scenario"] != b2["scenario"]["scenario"]
+    pid1 = b1["scenario"]["pids"][0]
+    pid2 = b2["scenario"]["pids"][0]
+    assert pid1 != pid2
+
+    for body, expected_pid, expected_interval in (
+        (b1, pid1, 2.0),
+        (b2, pid2, 1.0),
+    ):
+        unconf = body["inspection"]["unconfirmable_pids"]
+        assert len(unconf) == 1
+        assert unconf[0]["pid"] == expected_pid
+        assert unconf[0]["round1"] is not None
+        assert unconf[0]["round2"] is None
+        assert body["exit_confirmation"]["state"] == "exited"
+        assert body["exit_confirmation"]["pid"] == expected_pid
+        assert (
+            body["exit_confirmation"]["interval_seconds_waited"]
+            == expected_interval
+        )
+
+    # 两个 holder 都应真正退出，sample 侧无残留登记
+    status = httpx.get(f"{base}/demo/status", timeout=10).json()
+    assert status == {}
+    for pid in (pid1, pid2):
+        assert not os.path.exists(f"/proc/{pid}")
 
     httpx.delete(f"{base}/demo/cleanup", timeout=10)
 

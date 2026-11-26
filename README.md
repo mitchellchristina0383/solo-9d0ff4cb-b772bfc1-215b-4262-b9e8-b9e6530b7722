@@ -32,7 +32,7 @@ sample/              本地样例：可复现 CLOSE_WAIT 的场景服务
   sample_app.py      场景控制（拉起/释放 holder 进程）
   holder.py          持有连接的样例进程（fork 共享 / 等待信号退出）
   closer.py          接受连接后立即关闭，使对端进入 CLOSE_WAIT
-tests/               24 项测试：假 procfs 单测、API 测试、真实 /proc、真实服务 e2e
+tests/               32 项测试：假 procfs 单测、API 测试（含并发隔离/失败回收）、真实 /proc、真实服务 e2e
 docker-compose.yml   两容器编排（api 共享 sample 的 PID 命名空间）
 ```
 
@@ -62,7 +62,7 @@ holder 父进程建连后 fork 出 2 个子进程，父子共 3 个 PID 持有**
 （同一 inode）**；closer 主动断开后该连接在所有 holder 上进入 CLOSE_WAIT。
 返回中该连接只出现一次，`holders_round2` 列出全部 3 个 PID 及各自 FD。
 
-### 场景二：巡检中进程退出
+### 场景二：巡检中进程退出（并发安全）
 
 `POST /demo/run-exit-during-inspection`，请求体：
 
@@ -70,8 +70,31 @@ holder 父进程建连后 fork 出 2 个子进程，父子共 3 个 PID 持有**
 { "interval_seconds": 2 }
 ```
 
-服务在两轮采样间隔过半时通知 holder 退出；第二轮采样发现进程消失，该 PID 进入
-`unconfirmable_pids`（含原因与第一轮身份信息），`rounds[1].failed_pids` 同步记录。
+每次调用都会向 sample 服务申请一个**独立命名的场景实例**（`exit-during-inspection-<uuid>`），
+编排时序严格按以下步骤执行，因此可以在两个 `/docs` 标签页用不同间隔同时试跑：
+
+1. **申请独占实例**：本次演示只持有、释放、回收自己 setup 出来的 holder 进程；
+   两个并发请求互不干扰，第二个请求无需等待第一个结束，可在其等待第二轮采样期间直接开始。
+2. **先做第一轮采样**：确认确实从 `/proc` 采到了本次 holder（身份 + CLOSE_WAIT 连接均在），
+   否则直接返回错误并回收本次实例，不会返回"假成功"。
+3. **首轮确认后才发 release**：信号只发给本实例的 holder（按实例名路由）。
+4. **睡满完整设定间隔**：不是"间隔过半就退出"，而是 release 后仍等足 `interval_seconds`。
+5. **双重确认退出后再二采**：同时核对 sample 实例登记状态与共享 `/proc/<pid>/stat`
+   的进程身份（starttime），能识别 PID 被新进程换代（`reused`）；确认退出后才开始第二轮采样。
+6. 第二轮发现进程消失，该 PID 进入 `unconfirmable_pids`（含原因与第一轮身份信息），
+   `rounds[1].failed_pids` 同步记录；返回体额外带 `exit_confirmation` 说明退出确认结果。
+
+任何一步失败（首轮采不到、release 被拒、退出超时等）都返回 4xx/5xx 错误，
+并尽力 `DELETE` 回收本次实例的 holder，不留孤儿进程。
+
+sample 侧对应的实例级接口（`name` 为 setup 返回的实例名）：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| POST | `/scenarios/exit-during-inspection/setup` | 生成独立实例并拉起 holder |
+| POST | `/scenarios/exit-during-inspection/{name}/release` | 只释放该实例的 holder |
+| GET | `/scenarios/exit-during-inspection/{name}/status` | 查该实例 holder 是否存活 |
+| DELETE | `/scenarios/exit-during-inspection/{name}` | 回收该实例（幂等，可安全重试） |
 
 ### 直接巡检任意 PID
 
@@ -125,7 +148,7 @@ SAMPLE_BASE_URL=http://127.0.0.1:8001 \
 
 ```bash
 pip install -r requirements.txt pytest
-pytest                      # 全部 24 项（含真实进程 e2e，约 10s）
+pytest                      # 全部 32 项（含真实进程 e2e，约 16s）
 pytest -m "not live"        # 跳过需要拉起 uvicorn 的 e2e
 ```
 
