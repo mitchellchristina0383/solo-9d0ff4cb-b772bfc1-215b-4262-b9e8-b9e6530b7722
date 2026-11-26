@@ -1,0 +1,33 @@
+services:
+  sample:
+    build:
+      context: .
+      dockerfile: sample/Dockerfile
+    # 让 holder 进程拥有稳定、可被另一容器巡检的 PID 命名空间
+    init: false
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 关键：共享 sample 的 PID 命名空间，/proc 中才能看到 holder 及其子进程
+    pid: service:sample
+    environment:
+      SAMPLE_BASE_URL: http://sample:8001
+    ports:
+      - "8000:8000"
+    depends_on:
+      sample:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
